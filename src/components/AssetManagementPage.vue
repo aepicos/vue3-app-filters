@@ -3,7 +3,7 @@ import { ref } from 'vue'
 import BillboardCards from './BillboardCards.vue'
 import AssetTable from './AssetTable.vue'
 import FilterBar from './FilterBar.vue'
-import { FILTERS, type FilterChip, type AdvancedQuery } from '../data/filters'
+import { type FilterChip, type AdvancedQuery } from '../data/filters'
 
 const TABS = [
   'All assets',

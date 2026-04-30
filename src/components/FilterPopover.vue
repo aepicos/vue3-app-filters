@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick } from 'vue'
-import { FILTERS, type FilterDef, type FilterChip, type AdvancedQuery, type FilterGroup, type FilterCondition } from '../data/filters'
+import { FILTERS, type FilterDef, type FilterChip, type AdvancedQuery, type FilterGroup } from '../data/filters'
 import AdvancedFilterBuilder from './AdvancedFilterBuilder.vue'
 
 const props = defineProps<{

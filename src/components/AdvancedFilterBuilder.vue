@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, reactive, computed } from 'vue'
-import { FILTERS, type FilterCondition, type FilterGroup, type AdvancedQuery, type FilterChip } from '../data/filters'
+import { FILTERS, type AdvancedQuery } from '../data/filters'
 
 const props = defineProps<{
   initialQuery: AdvancedQuery
@@ -157,11 +157,6 @@ function handleApply() {
 // Exposed so FilterPopover can call this from its own footer button
 defineExpose({ handleApply })
 
-// ── Summary helpers ───────────────────────────────────────────────────────────
-
-function operatorLabel(op: 'AND' | 'OR') {
-  return op
-}
 </script>
 
 <template>
