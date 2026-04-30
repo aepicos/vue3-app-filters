@@ -1,22 +1,27 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick } from 'vue'
-import { FILTERS, type FilterDef, type FilterChip } from '../data/filters'
+import { FILTERS, type FilterDef, type FilterChip, type AdvancedQuery, type FilterGroup, type FilterCondition } from '../data/filters'
+import AdvancedFilterBuilder from './AdvancedFilterBuilder.vue'
 
 const props = defineProps<{
   open: boolean
   anchorEl: HTMLElement | null
+  currentFilters?: FilterChip[]
+  currentAdvancedQuery?: AdvancedQuery | null
+  startAdvanced?: boolean
 }>()
 
 const emit = defineEmits<{
   close: []
   add: [chip: FilterChip]
+  applyAdvanced: [query: AdvancedQuery]
 }>()
 
 // ── State ─────────────────────────────────────────────────────────────────────
 const search = ref('')
 const hoveredFilter = ref<FilterDef | null>(null)
 const focusedFilterIdx = ref(-1)
-const mode = ref<'browse' | 'value-select'>('browse')
+const mode = ref<'browse' | 'value-select' | 'advanced'>('browse')
 const pendingFilter = ref<FilterDef | null>(null)
 const pendingOperator = ref('')
 const textInput = ref('')
@@ -24,6 +29,50 @@ const popoverStyle = ref<Record<string, string>>({})
 const popoverEl = ref<HTMLElement | null>(null)
 const searchInputEl = ref<HTMLInputElement | null>(null)
 const textInputEl = ref<HTMLInputElement | null>(null)
+
+// ── Advanced query state ───────────────────────────────────────────────────────
+const advancedInitialQuery = ref<AdvancedQuery>({ groupOperator: 'OR', groups: [] })
+const advancedBuilderRef = ref<InstanceType<typeof AdvancedFilterBuilder> | null>(null)
+
+function uid() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+// Convert simple FilterChips to AdvancedQuery by distributing OR-within-filterId
+// into groups. E.g. [Team X, Team Y, Class A] →
+//   Group1: Team X AND Class A  |OR|  Group2: Team Y AND Class A
+function chipsToAdvancedQuery(chips: FilterChip[]): AdvancedQuery {
+  if (chips.length === 0) return { groupOperator: 'OR', groups: [{ id: uid(), operator: 'AND', conditions: [] }] }
+
+  // Group chips by filterId
+  const byFilter = new Map<string, FilterChip[]>()
+  for (const chip of chips) {
+    const key = chip.filterId ?? chip.id
+    if (!byFilter.has(key)) byFilter.set(key, [])
+    byFilter.get(key)!.push(chip)
+  }
+
+  // Cartesian product across filter dimensions → one group per combination
+  const dimensionArrays = Array.from(byFilter.values())
+  const combinations: FilterChip[][] = dimensionArrays.reduce<FilterChip[][]>(
+    (acc, dim) => acc.flatMap((combo) => dim.map((chip) => [...combo, chip])),
+    [[]],
+  )
+
+  const groups: FilterGroup[] = combinations.map((combo) => ({
+    id: uid(),
+    operator: 'AND' as const,
+    conditions: combo.map((chip) => ({
+      id: uid(),
+      filterId: chip.filterId ?? '',
+      key: chip.key,
+      operator: chip.operator,
+      value: chip.value,
+    })),
+  }))
+
+  return { groupOperator: 'OR', groups }
+}
 
 watch(
   () => props.open,
@@ -38,22 +87,33 @@ watch(
     focusedFilterIdx.value = -1
     await nextTick()
     positionPopover()
-    searchInputEl.value?.focus()
+    if (props.startAdvanced) {
+      openAdvanced()
+    } else {
+      searchInputEl.value?.focus()
+    }
   },
 )
 
 function positionPopover() {
   if (!props.anchorEl) return
   const rect = props.anchorEl.getBoundingClientRect()
+  const isAdv = mode.value === 'advanced'
+  const popoverWidth = isAdv ? 580 : 480
   let left = rect.left + window.scrollX
-  const popoverWidth = 480
   if (left + popoverWidth > window.innerWidth - 8) {
     left = window.innerWidth - popoverWidth - 8
   }
-  popoverStyle.value = {
-    top: `${rect.bottom + window.scrollY + 6}px`,
-    left: `${left}px`,
+  const top = rect.bottom + window.scrollY + 6
+  const style: Record<string, string> = { top: `${top}px`, left: `${left}px` }
+  if (isAdv) {
+    // Set an explicit height so the CSS grid has a definite size to work with.
+    // max-height alone doesn't give grid/flex children a definite height on
+    // position:absolute elements, so the footer would get pushed off screen.
+    const available = window.innerHeight - rect.bottom - 6 - 12
+    style.height = `${Math.min(available, window.innerHeight * 0.85)}px`
   }
+  popoverStyle.value = style
 }
 
 // ── Computed ──────────────────────────────────────────────────────────────────
@@ -251,6 +311,27 @@ function backToBrowse() {
   nextTick(() => searchInputEl.value?.focus())
 }
 
+async function openAdvanced() {
+  if (props.currentAdvancedQuery) {
+    advancedInitialQuery.value = props.currentAdvancedQuery
+  } else {
+    advancedInitialQuery.value = chipsToAdvancedQuery(props.currentFilters ?? [])
+  }
+  mode.value = 'advanced'
+  await nextTick()
+  positionPopover()
+}
+
+function handleAdvancedApply(query: AdvancedQuery) {
+  emit('applyAdvanced', query)
+  emit('close')
+}
+
+function handleAdvancedCancel() {
+  mode.value = 'browse'
+  nextTick(() => searchInputEl.value?.focus())
+}
+
 // ── Keyboard ──────────────────────────────────────────────────────────────────
 function handlePopoverKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') emit('close')
@@ -316,14 +397,35 @@ function handleValueKeydown(e: KeyboardEvent) {
       v-if="open"
       ref="popoverEl"
       class="filter-popover"
+      :class="{ 'filter-popover--advanced': mode === 'advanced' }"
       :style="popoverStyle"
       role="dialog"
       aria-modal="true"
-      aria-label="Add filter"
+      :aria-label="mode === 'advanced' ? 'Advanced filter builder' : 'Add filter'"
       @keydown="handlePopoverKeydown"
     >
+      <!-- Advanced mode ──────────────────────────────── -->
+      <template v-if="mode === 'advanced'">
+        <div class="fp-adv-header">
+          <svg class="fp-adv-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+            <path d="M3 6h18M7 12h10M11 18h2"/>
+          </svg>
+          <span>Advanced filter</span>
+        </div>
+        <AdvancedFilterBuilder
+          ref="advancedBuilderRef"
+          :initial-query="advancedInitialQuery"
+          @apply="handleAdvancedApply"
+          @cancel="handleAdvancedCancel"
+        />
+        <div class="fp-adv-footer">
+          <button class="fp-adv-btn fp-adv-btn--cancel" @click="handleAdvancedCancel">Cancel</button>
+          <button class="fp-adv-btn fp-adv-btn--apply" @click="advancedBuilderRef?.handleApply()">Apply filter</button>
+        </div>
+      </template>
+
       <!-- Search ─────────────────────────────────────── -->
-      <div class="fp-search">
+      <div v-else class="fp-search">
         <svg
           class="fp-search-icon"
           viewBox="0 0 24 24"
@@ -552,10 +654,9 @@ function handleValueKeydown(e: KeyboardEvent) {
       </div>
 
       <!-- Footer ─────────────────────────────────────── -->
-      <div class="fp-footer">
-        <button class="fp-advanced" disabled aria-disabled="true">
+      <div v-if="mode !== 'advanced'" class="fp-footer">
+        <button class="fp-advanced" @click="openAdvanced">
           Advanced filter
-          <span class="fp-advanced-badge" aria-label="coming soon">Soon</span>
         </button>
       </div>
     </div>
@@ -584,6 +685,33 @@ function handleValueKeydown(e: KeyboardEvent) {
   overflow: hidden;
   font-size: 14px;
   color: #1c1c21;
+  transition: width 0.2s ease;
+}
+.filter-popover--advanced {
+  width: 580px;
+  /* height is set dynamically by positionPopover() so the grid has a
+     definite size — max-height alone doesn't work on position:absolute */
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+/* ── Advanced mode header ─────── */
+.fp-adv-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid #f2f1f4;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1c1c21;
+  flex-shrink: 0;
+}
+.fp-adv-icon {
+  width: 16px;
+  height: 16px;
+  color: #7c3aed;
+  flex-shrink: 0;
 }
 
 /* ── Search ───────────────────────── */
@@ -945,6 +1073,33 @@ function handleValueKeydown(e: KeyboardEvent) {
   background: #374151;
 }
 
+/* ── Advanced footer ──────────────── */
+.fp-adv-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid #f2f1f4;
+  flex-shrink: 0;
+}
+
+.fp-adv-btn {
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid transparent;
+  outline: none;
+  line-height: 1.4;
+}
+.fp-adv-btn:focus-visible { outline: 2px solid #7c3aed; outline-offset: 2px; }
+.fp-adv-btn--cancel { background: #fff; border-color: #d1d5db; color: #374151; }
+.fp-adv-btn--cancel:hover { background: #f9fafb; }
+.fp-adv-btn--apply { background: #7c3aed; color: #fff; border-color: #7c3aed; }
+.fp-adv-btn--apply:hover { background: #6d28d9; }
+
 /* ── Footer ───────────────────────── */
 .fp-footer {
   border-top: 1px solid #f2f1f4;
@@ -959,19 +1114,13 @@ function handleValueKeydown(e: KeyboardEvent) {
   border: none;
   background: transparent;
   font-size: 13px;
-  color: #9ca3af;
-  cursor: not-allowed;
+  color: #6b7280;
+  cursor: pointer;
   border-radius: 6px;
   width: 100%;
   text-align: left;
+  outline: none;
 }
-.fp-advanced-badge {
-  font-size: 10px;
-  padding: 1px 5px;
-  background: #f3f4f6;
-  border-radius: 4px;
-  color: #9ca3af;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
+.fp-advanced:hover { background: #f4f3f7; color: #374151; }
+.fp-advanced:focus-visible { outline: 2px solid #7c3aed; outline-offset: 1px; }
 </style>

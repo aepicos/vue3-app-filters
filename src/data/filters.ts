@@ -29,6 +29,27 @@ export interface FilterChip {
   value: string
 }
 
+// ── Advanced query types ──────────────────────────────────────────────────────
+
+export interface FilterCondition {
+  id: string
+  filterId: string
+  key: string
+  operator: string
+  value: string
+}
+
+export interface FilterGroup {
+  id: string
+  operator: 'AND' | 'OR'
+  conditions: FilterCondition[]
+}
+
+export interface AdvancedQuery {
+  groupOperator: 'AND' | 'OR'
+  groups: FilterGroup[]
+}
+
 export const FILTERS: FilterDef[] = [
   {
     id: 'asset-type',

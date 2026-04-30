@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
-import type { FilterChip } from '../data/filters'
+import type { FilterChip, FilterCondition, AdvancedQuery } from '../data/filters'
 
 /* ============================================================
    PROPS
@@ -9,6 +9,7 @@ import type { FilterChip } from '../data/filters'
 const props = defineProps<{
   search?: string
   filters?: FilterChip[]
+  advancedQuery?: AdvancedQuery | null
 }>()
 
 /* ============================================================
@@ -439,6 +440,19 @@ function applyChip(item: AssetItem, chip: FilterChip): boolean {
   }
 }
 
+function applyAdvancedQuery(item: AssetItem, query: AdvancedQuery): boolean {
+  if (query.groups.length === 0) return true
+  const matchGroup = (group: { operator: 'AND' | 'OR'; conditions: FilterCondition[] }): boolean => {
+    if (group.conditions.length === 0) return true
+    return group.operator === 'AND'
+      ? group.conditions.every((c) => applyChip(item, c))
+      : group.conditions.some((c) => applyChip(item, c))
+  }
+  return query.groupOperator === 'AND'
+    ? query.groups.every(matchGroup)
+    : query.groups.some(matchGroup)
+}
+
 const filteredDataset = computed<AssetItem[]>(() => {
   let result: AssetItem[] = DATASET
 
@@ -452,19 +466,24 @@ const filteredDataset = computed<AssetItem[]>(() => {
     )
   }
 
-  const chips = props.filters ?? []
-  if (chips.length) {
-    const groups = new Map<string, FilterChip[]>()
-    for (const chip of chips) {
-      const key = chip.filterId ?? chip.id
-      if (!groups.has(key)) groups.set(key, [])
-      groups.get(key)!.push(chip)
-    }
-    result = result.filter((item) =>
-      Array.from(groups.values()).every((group) =>
-        group.some((chip) => applyChip(item, chip))
+  if (props.advancedQuery && props.advancedQuery.groups.length > 0) {
+    const aq = props.advancedQuery
+    result = result.filter((item) => applyAdvancedQuery(item, aq))
+  } else {
+    const chips = props.filters ?? []
+    if (chips.length) {
+      const chipGroups = new Map<string, FilterChip[]>()
+      for (const chip of chips) {
+        const key = chip.filterId ?? chip.id
+        if (!chipGroups.has(key)) chipGroups.set(key, [])
+        chipGroups.get(key)!.push(chip)
+      }
+      result = result.filter((item) =>
+        Array.from(chipGroups.values()).every((group) =>
+          group.some((chip) => applyChip(item, chip))
+        )
       )
-    )
+    }
   }
 
   return result
@@ -696,6 +715,7 @@ function resetAndReload() {
 
 watch(() => props.search, resetAndReload)
 watch(() => props.filters, resetAndReload, { deep: true })
+watch(() => props.advancedQuery, resetAndReload, { deep: true })
 watch(() => groupBy.value, resetAndReload)
 
 /* ============================================================

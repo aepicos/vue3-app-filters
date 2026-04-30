@@ -3,7 +3,7 @@ import { ref } from 'vue'
 import BillboardCards from './BillboardCards.vue'
 import AssetTable from './AssetTable.vue'
 import FilterBar from './FilterBar.vue'
-import { FILTERS, type FilterChip } from '../data/filters'
+import { FILTERS, type FilterChip, type AdvancedQuery } from '../data/filters'
 
 const TABS = [
   'All assets',
@@ -18,12 +18,14 @@ const activeTab = ref('All assets')
 const search = ref('')
 
 const filters = ref<FilterChip[]>([])
+const advancedQuery = ref<AdvancedQuery | null>(null)
 
 function removeFilter(id: string) {
   filters.value = filters.value.filter((f) => f.id !== id)
 }
 
 function addFilter(chip: FilterChip) {
+  advancedQuery.value = null
   filters.value.push(chip)
 }
 
@@ -35,6 +37,15 @@ function setOperator(id: string, operator: string) {
 function setValue(id: string, value: string) {
   const chip = filters.value.find((f) => f.id === id)
   if (chip) chip.value = value
+}
+
+function applyAdvanced(query: AdvancedQuery) {
+  filters.value = []
+  advancedQuery.value = query
+}
+
+function clearAdvanced() {
+  advancedQuery.value = null
 }
 </script>
 
@@ -103,10 +114,13 @@ function setValue(id: string, value: string) {
     <!-- Filter bar -->
     <FilterBar
       :filters="filters"
+      :advanced-query="advancedQuery"
       @remove="removeFilter"
       @add="addFilter"
       @set-operator="setOperator"
       @set-value="setValue"
+      @apply-advanced="applyAdvanced"
+      @clear-advanced="clearAdvanced"
     />
 
     <!-- Content area -->
@@ -120,7 +134,7 @@ function setValue(id: string, value: string) {
         class="sticky top-0 flex flex-col"
         style="height: calc(100vh - 56px - 2rem);"
       >
-        <AssetTable :search="search" :filters="filters" />
+        <AssetTable :search="search" :filters="filters" :advanced-query="advancedQuery" />
       </div>
     </div>
   </main>
