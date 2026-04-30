@@ -119,6 +119,21 @@ function positionPopover() {
 // ── Computed ──────────────────────────────────────────────────────────────────
 const isSearchMode = computed(() => search.value.trim().length > 0)
 
+// Ghost-text type-ahead: shown when the raw query is a case-insensitive prefix
+// of a single matched enum value. Tab accepts — sets input to the full value.
+interface GhostSuggestion { completion: string; fullValue: string }
+const ghostSuggestion = computed<GhostSuggestion | null>(() => {
+  if (nlpChips.value.length !== 1) return null
+  const chip = nlpChips.value[0]
+  if (chip.filter.type !== 'enum') return null
+  const q = search.value // raw, preserve casing for transparent-text width match
+  if (!q) return null
+  if (!chip.value.toLowerCase().startsWith(q.toLowerCase())) return null
+  const completion = chip.value.slice(q.length)
+  if (!completion) return null
+  return { completion, fullValue: chip.value }
+})
+
 const browseFilters = computed(() => {
   if (!isSearchMode.value) return FILTERS
   const q = search.value.toLowerCase()
@@ -338,6 +353,11 @@ function handlePopoverKeydown(e: KeyboardEvent) {
 }
 
 function handleSearchKeydown(e: KeyboardEvent) {
+  if (e.key === 'Tab' && ghostSuggestion.value) {
+    e.preventDefault()
+    search.value = ghostSuggestion.value.fullValue
+    return
+  }
   if (e.key === 'ArrowDown' && mode.value === 'browse') {
     e.preventDefault()
     focusedFilterIdx.value = 0
@@ -437,16 +457,20 @@ function handleValueKeydown(e: KeyboardEvent) {
           <circle cx="11" cy="11" r="8" />
           <path d="m21 21-4.35-4.35" />
         </svg>
-        <input
-          ref="searchInputEl"
-          v-model="search"
-          type="text"
-          class="fp-search-input"
-          placeholder="Search or describe in plain text…"
-          aria-label="Search filters or describe in plain text"
-          autocomplete="off"
-          @keydown="handleSearchKeydown"
-        />
+        <div class="fp-input-wrap">
+          <div v-if="ghostSuggestion" class="fp-ghost" aria-hidden="true"
+            ><span class="fp-ghost-typed">{{ search }}</span><span class="fp-ghost-completion">{{ ghostSuggestion.completion }}</span></div>
+          <input
+            ref="searchInputEl"
+            v-model="search"
+            type="text"
+            class="fp-search-input"
+            placeholder="Search or describe in plain text…"
+            aria-label="Search filters or describe in plain text"
+            autocomplete="off"
+            @keydown="handleSearchKeydown"
+          />
+        </div>
       </div>
 
       <!-- Browse: two-pane ───────────────────────────── -->
@@ -729,14 +753,42 @@ function handleValueKeydown(e: KeyboardEvent) {
   color: #9ca3af;
   flex-shrink: 0;
 }
-.fp-search-input {
+.fp-input-wrap {
+  position: relative;
   flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.fp-ghost {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  font-size: 14px;
+  pointer-events: none;
+  white-space: pre;
+  overflow: hidden;
+}
+.fp-ghost-typed {
+  color: transparent;
+}
+.fp-ghost-completion {
+  color: #b3b2bd;
+}
+
+.fp-search-input {
+  width: 100%;
   border: none;
   outline: none;
+  padding: 0;
   font-size: 14px;
   color: #1c1c21;
   background: transparent;
   min-width: 0;
+  position: relative;
+  z-index: 1;
 }
 .fp-search-input::placeholder {
   color: #9ca3af;
