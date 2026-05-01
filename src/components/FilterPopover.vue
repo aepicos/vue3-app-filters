@@ -25,6 +25,12 @@ const mode = ref<'browse' | 'value-select' | 'advanced'>('browse')
 const pendingFilter = ref<FilterDef | null>(null)
 const pendingOperator = ref('')
 const textInput = ref('')
+const pendingNlpChips = ref<FilterChip[]>([])
+// Index into `search` up to which text has been confirmed into pending chips.
+// NLP / ghost run only on search.slice(confirmedBoundary).
+const confirmedBoundary = ref(0)
+// Boundary snapshot before each staged chip — used to roll back on backspace.
+const chipBoundaries = ref<number[]>([])
 const popoverStyle = ref<Record<string, string>>({})
 const popoverEl = ref<HTMLElement | null>(null)
 const searchInputEl = ref<HTMLInputElement | null>(null)
@@ -85,6 +91,9 @@ watch(
     pendingOperator.value = ''
     textInput.value = ''
     focusedFilterIdx.value = -1
+    pendingNlpChips.value = []
+    confirmedBoundary.value = 0
+    chipBoundaries.value = []
     await nextTick()
     positionPopover()
     if (props.startAdvanced) {
@@ -117,26 +126,29 @@ function positionPopover() {
 }
 
 // ── Computed ──────────────────────────────────────────────────────────────────
-const isSearchMode = computed(() => search.value.trim().length > 0)
+// The portion of the search string that hasn't yet been confirmed into a chip.
+const activeText = computed(() => search.value.slice(confirmedBoundary.value))
+const isSearchMode = computed(() => activeText.value.trim().length > 0)
 
-// Ghost-text type-ahead: shown when the raw query is a case-insensitive prefix
-// of a single matched enum value. Tab accepts — sets input to the full value.
+// Ghost-text type-ahead: shown when a matched enum value can be completed from
+// the current input fragment. Tab commits the chip and clears the input.
 interface GhostSuggestion { completion: string; fullValue: string }
 const ghostSuggestion = computed<GhostSuggestion | null>(() => {
-  if (nlpChips.value.length !== 1) return null
-  const chip = nlpChips.value[0]
+  const chips = nlpChips.value
+  if (!chips.length) return null
+  const chip = chips[0]
   if (chip.filter.type !== 'enum') return null
-  const q = search.value // raw, preserve casing for transparent-text width match
+  const q = activeText.value
   if (!q) return null
-  if (!chip.value.toLowerCase().startsWith(q.toLowerCase())) return null
-  const completion = chip.value.slice(q.length)
-  if (!completion) return null
-  return { completion, fullValue: chip.value }
+  const fragment = getValueFragment(q, chip.value)
+  if (!fragment) return null
+  const completion = chip.value.slice(fragment.length)
+  return completion ? { completion, fullValue: chip.value } : null
 })
 
 const browseFilters = computed(() => {
   if (!isSearchMode.value) return FILTERS
-  const q = search.value.toLowerCase()
+  const q = activeText.value.toLowerCase()
   return FILTERS.filter((f) => f.label.toLowerCase().includes(q))
 })
 
@@ -147,7 +159,7 @@ interface SearchGroup {
 
 const searchGroups = computed<SearchGroup[]>(() => {
   if (!isSearchMode.value) return []
-  const q = search.value.toLowerCase()
+  const q = activeText.value.toLowerCase()
   const groups: SearchGroup[] = []
   for (const f of FILTERS) {
     const labelMatch = f.label.toLowerCase().includes(q)
@@ -186,6 +198,115 @@ const STOP_WORDS = new Set([
   'owned', 'belonging', 'assigned', 'asset', 'assets',
 ])
 
+// ── Explicit operator syntax ("field op value") ───────────────────────────────
+const SYMBOL_TO_OPS: Record<string, string[]> = {
+  '=':  ['is', '=', 'equals'],
+  '!=': ['is not', '!=', 'does not contain'],
+  '>':  ['>', 'is higher than'],
+  '>=': ['>=', '>', 'is higher than'],
+  '<':  ['<', 'is lower than'],
+  '<=': ['<=', '<', 'is lower than'],
+}
+
+function matchFilterByLabel(labelPart: string): FilterDef | null {
+  const lp = labelPart.toLowerCase().trim()
+  if (!lp) return null
+  return (
+    FILTERS.find(f => f.label.toLowerCase() === lp) ??
+    FILTERS.find(f => f.label.toLowerCase().startsWith(lp)) ??
+    FILTERS.find(f => f.label.toLowerCase().split(/\s+/).some(w => w.startsWith(lp))) ??
+    null
+  )
+}
+
+// Word operators ordered longest/most-specific first so "is not" beats "is",
+// "does not contain" beats "contains", etc.
+const WORD_OPERATORS: Array<{ pattern: RegExp; ops: string[] }> = [
+  { pattern: /does\s+not\s+contain/i, ops: ['does not contain'] },
+  { pattern: /doesn'?t\s+contain/i,   ops: ['does not contain'] },
+  { pattern: /is\s+not/i,             ops: ['is not'] },
+  { pattern: /higher\s+than/i,        ops: ['>', 'is higher than'] },
+  { pattern: /greater\s+than/i,       ops: ['>', 'is higher than'] },
+  { pattern: /more\s+than/i,          ops: ['>', 'is higher than'] },
+  { pattern: /lower\s+than/i,         ops: ['<', 'is lower than'] },
+  { pattern: /less\s+than/i,          ops: ['<', 'is lower than'] },
+  { pattern: /at\s+least/i,           ops: ['>=', '>'] },
+  { pattern: /at\s+most/i,            ops: ['<=', '<'] },
+  { pattern: /above/i,                ops: ['>', 'is higher than'] },
+  { pattern: /over/i,                 ops: ['>', 'is higher than'] },
+  { pattern: /below/i,                ops: ['<', 'is lower than'] },
+  { pattern: /under/i,                ops: ['<', 'is lower than'] },
+  { pattern: /equals?\s+to/i,         ops: ['=', 'is', 'equals'] },
+  { pattern: /equals?/i,              ops: ['=', 'is', 'equals'] },
+  { pattern: /contains/i,             ops: ['contains', 'is'] },
+  { pattern: /is/i,                   ops: ['is', '='] },
+]
+
+function buildChip(filter: FilterDef, operator: string, valuePart: string): NlpChip | null {
+  if (filter.type === 'enum' && filter.values) {
+    if (!valuePart.trim()) return { filter, value: '', operator }
+    const match = filter.values.find(v => v.toLowerCase().startsWith(valuePart.toLowerCase()))
+    return match ? { filter, value: match, operator } : null
+  }
+  return valuePart.trim() ? { filter, value: valuePart.trim(), operator } : null
+}
+
+function parseExplicitChip(input: string): NlpChip | null {
+  const trimmed = input.trim()
+
+  // Symbol operators (!=, >=, <=, =, >, <)
+  const symMatch = trimmed.match(/^(.+?)\s*(!=|>=|<=|=|>|<)\s*(.*)$/)
+  if (symMatch) {
+    const [, labelPart, opSymbol, valuePart] = symMatch
+    const filter = matchFilterByLabel(labelPart)
+    if (filter) {
+      const candidates = SYMBOL_TO_OPS[opSymbol] ?? []
+      const operator = candidates.find(c => filter.operators.includes(c)) ?? filter.operators[0]
+      return buildChip(filter, operator, valuePart)
+    }
+  }
+
+  // Word operators ("is not", "above", "higher than", "is", etc.)
+  for (const { pattern, ops } of WORD_OPERATORS) {
+    const re = new RegExp(`^(.+?)\\s+${pattern.source}\\s*(.*)$`, 'i')
+    const m = trimmed.match(re)
+    if (!m) continue
+    const [, labelPart, valuePart] = m
+    const filter = matchFilterByLabel(labelPart)
+    if (!filter) continue
+    const operator = ops.find(o => filter.operators.includes(o)) ?? filter.operators[0]
+    return buildChip(filter, operator, valuePart)
+  }
+
+  return null
+}
+
+// Find the fragment of the raw input that corresponds to the value being typed,
+// so the ghost overlay can show the completion at the right position.
+// Works for both "team = leg" (explicit) and "assets owned by leg" (NLP).
+function getValueFragment(q: string, chipValue: string): string | null {
+  const valueLower = chipValue.toLowerCase()
+  // Case 1: everything after an explicit operator
+  const opMatch = q.match(/(?:!=|>=|<=|=|>|<)\s*(.+)$/)
+  if (opMatch) {
+    const vf = opMatch[1].trim()
+    if (vf && valueLower.startsWith(vf.toLowerCase())) return vf
+  }
+  // Case 2: longest word-boundary-aligned suffix that is a prefix of the value
+  const qLower = q.toLowerCase()
+  const wordStarts: number[] = [0]
+  for (let i = 1; i < q.length; i++) {
+    if (/[\s=!<>]/.test(q[i - 1])) wordStarts.push(i)
+  }
+  for (const start of wordStarts) {
+    const fragment = qLower.slice(start).trim()
+    if (fragment.length >= 1 && valueLower.startsWith(fragment)) {
+      return q.slice(start).trim()
+    }
+  }
+  return null
+}
+
 // Split query into "phrase clusters" — runs of consecutive non-stop tokens.
 // Stop words and hyphens act as boundaries between phrases.
 // "class a assets owned by trimdon" → [["class"], ["trimdon"]]
@@ -223,33 +344,24 @@ const isNlp = computed(() => isSearchMode.value)
 
 interface NlpChip { filter: FilterDef; value: string; operator?: string }
 
-const nlpChips = computed<NlpChip[]>(() => {
-  if (!isNlp.value) return []
-  const allQueryTokens = tokenize(search.value)
-  const phrases = queryPhrases(search.value)
-  const q = search.value.toLowerCase()
+// Core NLP logic run against a specific text string (used directly and for "not X" prefix).
+function computeNlpChipsFromText(text: string): NlpChip[] {
+  const allQueryTokens = tokenize(text)
+  const phrases = queryPhrases(text)
+  const q = text.toLowerCase()
   const results: NlpChip[] = []
   const used = new Set<string>()
 
   // ── Number filters ("risk score higher than 650") ──────────────────────────
-  const numMatch = search.value.match(/\b(\d+)\b/)
+  const numMatch = text.match(/\b(\d+)\b/)
   if (numMatch) {
     const numVal = numMatch[1]
-    const qStems = search.value
-      .toLowerCase()
-      .replace(/['".,!?:;()/\\-]/g, ' ')
-      .split(/\s+/)
-      .filter((w) => w.length > 0)
-      .map(stem)
+    const qStems = text.toLowerCase().replace(/['".,!?:;()/\\-]/g, ' ').split(/\s+/).filter(w => w.length > 0).map(stem)
     for (const filter of FILTERS) {
       if (filter.type !== 'number' || used.has(filter.id)) continue
-      // At least one label token must prefix-match a query token (or vice-versa)
       const labelTokens = filter.label.toLowerCase().split(/\s+/).map(stem)
-      const labelHit = labelTokens.some((lt) =>
-        qStems.some((qt) => qt.startsWith(lt) || lt.startsWith(qt)),
-      )
+      const labelHit = labelTokens.some(lt => qStems.some(qt => qt.startsWith(lt) || lt.startsWith(qt)))
       if (!labelHit) continue
-      // Map natural language to operator symbol
       let op = filter.operators[0]
       if (/higher than|more than|greater than|above|over/.test(q)) op = '>'
       else if (/lower than|less than|below|under/.test(q)) op = '<'
@@ -270,7 +382,7 @@ const nlpChips = computed<NlpChip[]>(() => {
         matched = allQueryTokens.has(filterKeyword) && allQueryTokens.has(value.toLowerCase())
       } else {
         const vTokens = [...tokenize(value)]
-        matched = phrases.some((phrase) => phraseMatchesValue(phrase, vTokens))
+        matched = phrases.some(phrase => phraseMatchesValue(phrase, vTokens))
       }
       if (matched && !used.has(filter.id)) {
         results.push({ filter, value })
@@ -280,6 +392,26 @@ const nlpChips = computed<NlpChip[]>(() => {
     }
   }
   return results
+}
+
+const nlpChips = computed<NlpChip[]>(() => {
+  if (!isNlp.value) return []
+  const active = activeText.value
+
+  // Explicit "field op value" syntax takes priority
+  const explicit = parseExplicitChip(active)
+  if (explicit?.value) return [explicit]
+
+  // "not X" → is not X  (e.g. "not trimdon" → Team is not Trimdon Grange Explosion)
+  const notPrefix = active.match(/^not\s+(.+)$/i)
+  if (notPrefix) {
+    return computeNlpChipsFromText(notPrefix[1]).map(c => ({
+      ...c,
+      operator: c.filter.operators.includes('is not') ? 'is not' : (c.operator ?? c.filter.operators[0]),
+    }))
+  }
+
+  return computeNlpChipsFromText(active)
 })
 
 // ── Actions ───────────────────────────────────────────────────────────────────
@@ -308,6 +440,9 @@ function submitText() {
 }
 
 function applyNlp() {
+  for (const chip of pendingNlpChips.value) {
+    emit('add', chip)
+  }
   for (const { filter, value, operator } of nlpChips.value) {
     emit('add', {
       id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -317,7 +452,17 @@ function applyNlp() {
       value,
     })
   }
+  pendingNlpChips.value = []
   emit('close')
+}
+
+function removePendingChip(id: string) {
+  const idx = pendingNlpChips.value.findIndex(c => c.id === id)
+  if (idx === -1) return
+  // Remove this chip and everything after it; restore boundary to before this chip.
+  pendingNlpChips.value.splice(idx)
+  confirmedBoundary.value = chipBoundaries.value[idx] ?? 0
+  chipBoundaries.value.splice(idx)
 }
 
 function backToBrowse() {
@@ -352,10 +497,55 @@ function handlePopoverKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') emit('close')
 }
 
+// ── watch: space auto-stage + backspace roll-back ─────────────────────────────
+watch(search, (newVal, oldVal) => {
+  // Space typed: auto-stage if a chip is fully typed (no ghost completion pending).
+  if (newVal.length > confirmedBoundary.value && newVal.endsWith(' ') && newVal.length > oldVal.length) {
+    const chips = nlpChips.value
+    if (chips.length > 0 && chips[0].value && !ghostSuggestion.value) {
+      const chip = chips[0]
+      chipBoundaries.value.push(confirmedBoundary.value)
+      pendingNlpChips.value.push({
+        id: uid(),
+        filterId: chip.filter.id,
+        key: chip.filter.label,
+        operator: chip.operator ?? chip.filter.operators[0],
+        value: chip.value,
+      })
+      confirmedBoundary.value = newVal.length
+    }
+    return
+  }
+
+  // Backspace/delete into confirmed zone: pop chips until boundary fits.
+  if (newVal.length < confirmedBoundary.value) {
+    while (pendingNlpChips.value.length > 0 && confirmedBoundary.value > newVal.length) {
+      pendingNlpChips.value.pop()
+      confirmedBoundary.value = chipBoundaries.value.pop() ?? 0
+    }
+    if (confirmedBoundary.value > newVal.length) confirmedBoundary.value = newVal.length
+  }
+})
+
 function handleSearchKeydown(e: KeyboardEvent) {
-  if (e.key === 'Tab' && ghostSuggestion.value) {
-    e.preventDefault()
-    search.value = ghostSuggestion.value.fullValue
+  if (e.key === 'Tab') {
+    const chips = nlpChips.value
+    if (chips.length > 0 && chips[0].value) {
+      e.preventDefault()
+      const chip = chips[0]
+      const completion = ghostSuggestion.value?.completion ?? ''
+      const newSearch = search.value + completion + ' '
+      chipBoundaries.value.push(confirmedBoundary.value)
+      pendingNlpChips.value.push({
+        id: uid(),
+        filterId: chip.filter.id,
+        key: chip.filter.label,
+        operator: chip.operator ?? chip.filter.operators[0],
+        value: chip.value,
+      })
+      search.value = newSearch
+      confirmedBoundary.value = newSearch.length
+    }
     return
   }
   if (e.key === 'ArrowDown' && mode.value === 'browse') {
@@ -363,8 +553,10 @@ function handleSearchKeydown(e: KeyboardEvent) {
     focusedFilterIdx.value = 0
     hoveredFilter.value = browseFilters.value[0] ?? null
     ;(popoverEl.value?.querySelector<HTMLElement>('.filter-item'))?.focus()
-  } else if (e.key === 'Enter' && isNlp.value && nlpChips.value.length) {
-    applyNlp()
+  } else if (e.key === 'Enter') {
+    if (pendingNlpChips.value.length > 0 || (isNlp.value && nlpChips.value.length > 0)) {
+      applyNlp()
+    }
   }
 }
 
@@ -473,6 +665,39 @@ function handleValueKeydown(e: KeyboardEvent) {
         </div>
       </div>
 
+      <!-- NLP / pending panel ────────────────────────── -->
+      <div
+        v-if="mode === 'browse' && (pendingNlpChips.length || (isNlp && nlpChips.length))"
+        class="fp-nlp"
+        role="region"
+        aria-label="AI suggestion"
+      >
+        <div class="fp-nlp-header" aria-hidden="true">
+          <svg class="fp-nlp-icon" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 3c1.93 0 3.5 1.57 3.5 3.5S13.93 13 12 13s-3.5-1.57-3.5-3.5S10.07 6 12 6zm7 13H5v-.23c0-.62.28-1.2.76-1.58C7.47 15.82 9.64 15 12 15s4.53.82 6.24 2.19c.48.38.76.97.76 1.58V19z" />
+          </svg>
+          AI suggestion
+        </div>
+        <div class="fp-nlp-chips" aria-label="Suggested filters">
+          <span
+            v-for="chip in pendingNlpChips"
+            :key="chip.id"
+            class="fp-nlp-chip fp-nlp-chip--pending"
+          >
+            {{ chip.key }} {{ chip.operator }} {{ chip.value }}
+            <button class="fp-nlp-chip-remove" @click="removePendingChip(chip.id)" aria-label="Remove filter">×</button>
+          </span>
+          <span
+            v-for="r in nlpChips"
+            :key="r.filter.id"
+            class="fp-nlp-chip"
+          >
+            {{ r.filter.label }} {{ r.operator ?? 'is' }} {{ r.value }}
+          </span>
+        </div>
+        <button class="fp-nlp-apply" @click="applyNlp">Apply all</button>
+      </div>
+
       <!-- Browse: two-pane ───────────────────────────── -->
       <div
         v-if="mode === 'browse' && !isSearchMode"
@@ -559,25 +784,6 @@ function handleValueKeydown(e: KeyboardEvent) {
         role="region"
         aria-label="Search results"
       >
-        <div v-if="isNlp && nlpChips.length" class="fp-nlp" role="region" aria-label="AI suggestion">
-          <div class="fp-nlp-header" aria-hidden="true">
-            <svg class="fp-nlp-icon" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 3c1.93 0 3.5 1.57 3.5 3.5S13.93 13 12 13s-3.5-1.57-3.5-3.5S10.07 6 12 6zm7 13H5v-.23c0-.62.28-1.2.76-1.58C7.47 15.82 9.64 15 12 15s4.53.82 6.24 2.19c.48.38.76.97.76 1.58V19z" />
-            </svg>
-            AI suggestion
-          </div>
-          <div class="fp-nlp-chips" aria-label="Suggested filters">
-            <span
-              v-for="r in nlpChips"
-              :key="r.filter.id"
-              class="fp-nlp-chip"
-            >
-              {{ r.filter.label }} {{ r.operator ?? 'is' }} {{ r.value }}
-            </span>
-          </div>
-          <button class="fp-nlp-apply" @click="applyNlp">Apply all</button>
-        </div>
-
         <div v-if="searchGroups.length" class="fp-groups">
           <div v-for="group in searchGroups" :key="group.filter.id" class="fp-group">
             <button
@@ -601,7 +807,7 @@ function handleValueKeydown(e: KeyboardEvent) {
           </div>
         </div>
 
-        <p v-else-if="!nlpChips.length" class="fp-no-results" role="status">
+        <p v-else-if="!nlpChips.length && !pendingNlpChips.length" class="fp-no-results" role="status">
           <template v-if="isNlp">Couldn't match any filters to "{{ search }}"</template>
           <template v-else>No filters match "{{ search }}"</template>
         </p>
@@ -918,6 +1124,27 @@ function handleValueKeydown(e: KeyboardEvent) {
   border-radius: 4px;
   font-size: 13px;
   color: #4c1d95;
+}
+.fp-nlp-chip--pending {
+  background: #7c3aed;
+  border-color: #7c3aed;
+  color: #fff;
+}
+.fp-nlp-chip-remove {
+  margin-left: 5px;
+  background: none;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0.7;
+  display: flex;
+  align-items: center;
+}
+.fp-nlp-chip-remove:hover {
+  opacity: 1;
 }
 .fp-nlp-apply {
   align-self: flex-start;
